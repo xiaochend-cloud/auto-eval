@@ -2,25 +2,29 @@
 """
 run_all.py  —  batch-run every probe the stored embeddings support, in ONE launch.
 
-Philosophy (K's rule): RUNNING is batch, UNDERSTANDING is serial.
-This squeezes all PoC5/PoC6 train+test embeddings for the experiments in
-final-presentation/experiments.md (Exp-1 metrics, Exp-2 OOD both directions,
-Exp-3 geometry + C<A mechanism, coverage sub-probe). Missing inputs are SKIPPED
-with a clear message, never crash the batch.
+Covers the experiments in final-presentation/experiments.md (Exp-1 metrics,
+Exp-2 OOD both directions, Exp-2b ambiguous-benign, Exp-3 geometry + C<A,
+Exp-4 calibration, coverage sub-probe). Missing inputs are SKIPPED with a clear
+message, never crash the batch.
 
-Each .npz (from extract_embeddings.py) must contain:
-    X     (N, D) float   pooled embedding (mmBERT-small masked-mean, D=384)
-    y     (N,)   int      0 = benign, 1 = malicious
-    prob  (N,)   float   sigmoid(z/T) or raw sigmoid(z)   (for AUPRC / recall@FPR)
-    logit (N,)   float   raw logit z                       (for margin plots)
+Input = Arrow shards. Each CONFIG entry points at a directory of `*.arrow` shards
+(or a single .arrow file) holding the embeddings + inference results, one row per
+prompt, with these columns (rename in COLS if yours differ):
+    embedding   list<float> length D=384   pooled mmBERT-small masked-mean
+    label       int                        0 = benign, 1 = malicious
+    prob        float                       sigmoid(z/T)  (for AUPRC / recall@FPR)
+    logit       float                       raw logit z   (for margins / calibration)
 
-Fill CONFIG with the paths you actually saved. Key naming:
+Fill CONFIG with your shard dirs. Key naming:
     {encoder-model}__{dataset}_{split}      e.g.  p5m__p5_test  =  PoC5-model encoding PoC5-test
+The first load of each key prints its column names + row count for verification.
 Run:  python run_all.py
 """
-import os, sys, warnings
+import os, sys, glob, warnings
 from datetime import date
 import numpy as np
+import pyarrow as pa
+import pyarrow.ipc
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -34,20 +38,23 @@ warnings.filterwarnings("ignore")
 # CONFIG — fill in the paths you saved. Leave a value as None if you don't have it.
 # ----------------------------------------------------------------------------
 CONFIG = {
+    # each value = a directory of *.arrow shards (or a single .arrow file)
     # in-distribution (each split under its OWN model)
-    "p5m__p5_train": "emb/p5model_p5train.npz",
-    "p5m__p5_test":  "emb/p5model_p5test.npz",
-    "p6m__p6_train": "emb/p6model_p6train.npz",
-    "p6m__p6_test":  "emb/p6model_p6test.npz",
+    "p5m__p5_train": "shards/p5model_p5train",
+    "p5m__p5_test":  "shards/p5model_p5test",
+    "p6m__p6_train": "shards/p6model_p6train",
+    "p6m__p6_test":  "shards/p6model_p6test",
     # cross encodings (from the 2x2 inference)
-    "p5m__p6_test":  "emb/p5model_p6test.npz",   # old model -> new data  (cell B)
-    "p6m__p5_test":  "emb/p6model_p5test.npz",   # new model -> old data  (cell C)
-    # calibration sets (logit + y is enough) -> Exp-4
-    "p5m__p5_cal":   "emb/p5model_p5cal.npz",
-    "p6m__p6_cal":   "emb/p6model_p6cal.npz",
+    "p5m__p6_test":  "shards/p5model_p6test",    # old model -> new data  (cell B)
+    "p6m__p5_test":  "shards/p6model_p5test",    # new model -> old data  (cell C)
+    # calibration sets (logit + label is enough) -> Exp-4
+    "p5m__p5_cal":   "shards/p5model_p5cal",
+    "p6m__p6_cal":   "shards/p6model_p6cal",
     # optional: coverage sub-probe needs PoC6-train under the PoC5-model (extra pass)
     "p5m__p6_train": None,
 }
+# Arrow column names — rename to match your schema
+COLS = {"emb": "embedding", "label": "label", "prob": "prob", "logit": "logit"}
 # deployed calibration (for Exp-4 reproduction check)
 DEPLOYED_T = {"p5m__p5_cal": 0.736, "p6m__p6_cal": 1.2811}
 OUTDIR = os.path.join("results", date.today().isoformat())   # results/YYYY-MM-DD/
@@ -57,13 +64,38 @@ TARGET_FPR = 0.01    # operating point for recall@FPR
 # ----------------------------------------------------------------------------
 # loading + metric helpers
 # ----------------------------------------------------------------------------
+def _read_arrow(path):
+    """Read a directory of *.arrow shards (or one .arrow file) into a single table."""
+    files = sorted(glob.glob(os.path.join(path, "*.arrow"))) if os.path.isdir(path) else [path]
+    tabs = []
+    for f in files:
+        try:                                              # HF-datasets = IPC stream format
+            with pa.memory_map(f, "r") as s:
+                tabs.append(pa.ipc.open_stream(s).read_all())
+        except Exception:                                 # fall back to IPC file format
+            with pa.memory_map(f, "r") as s:
+                tabs.append(pa.ipc.open_file(s).read_all())
+    return pa.concat_tables(tabs) if tabs else None
+
+_seen = set()
 def load(key):
-    """Return dict(X,y,prob,logit) or None if the file is absent."""
+    """Return dict(X,y,prob,logit) from Arrow shards, or None if absent."""
     path = CONFIG.get(key)
     if not path or not os.path.exists(path):
         return None
-    d = np.load(path)
-    return {k: d[k] for k in d.files}
+    tbl = _read_arrow(path)
+    if tbl is None:
+        return None
+    if key not in _seen:                                  # first load: show schema for verification
+        print(f"  [load {key}] columns={tbl.column_names}  rows={tbl.num_rows}")
+        _seen.add(key)
+    cols, out = tbl.column_names, {}
+    if COLS["emb"] in cols:
+        out["X"] = np.asarray(tbl.column(COLS["emb"]).to_pylist(), dtype=np.float32)
+    for name, k in [("label", "y"), ("prob", "prob"), ("logit", "logit")]:
+        if COLS[name] in cols:
+            out[k] = np.asarray(tbl.column(COLS[name]).to_pylist())
+    return out
 
 def recall_at_fpr(y, score, target_fpr=TARGET_FPR):
     fpr, tpr, _ = roc_curve(y, score)
