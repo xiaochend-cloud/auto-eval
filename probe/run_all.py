@@ -59,7 +59,8 @@ COLS = {"emb": "embedding", "label": "label", "prob": "prob", "logit": "logit"}
 DEPLOYED_T = {"p5m__p5_cal": 0.736, "p6m__p6_cal": 1.2811}
 OUTDIR = os.path.join("results", date.today().isoformat())   # results/YYYY-MM-DD/
 K_NN   = 10          # neighbours for kNN label-agreement / distance
-TARGET_FPR = 0.01    # operating point for recall@FPR
+TARGET_RECALL = 0.90 # PM operating point: precision @ recall 90%
+TARGET_FPR = 0.01    # (kept for reference; base-rate-invariant alternative)
 
 # ----------------------------------------------------------------------------
 # loading + metric helpers
@@ -101,6 +102,13 @@ def recall_at_fpr(y, score, target_fpr=TARGET_FPR):
     fpr, tpr, _ = roc_curve(y, score)
     ok = fpr <= target_fpr
     return float(tpr[ok].max()) if ok.any() else 0.0
+
+def precision_at_recall(y, score, target_recall=TARGET_RECALL):
+    """PM operating point: best precision achievable while recall >= target_recall."""
+    from sklearn.metrics import precision_recall_curve
+    prec, rec, _ = precision_recall_curve(y, score)
+    ok = rec >= target_recall
+    return float(prec[ok].max()) if ok.any() else 0.0
 
 def linear_probe_acc(X, y):
     clf = LogisticRegression(max_iter=2000, class_weight="balanced")
@@ -166,17 +174,17 @@ os.makedirs(OUTDIR, exist_ok=True)
 # ----------------------------------------------------------------------------
 # Experiment 1 — 2x2 metrics (AUPRC + recall@1%FPR)
 # ----------------------------------------------------------------------------
-hdr("Experiment 1 — 2x2 cross-evaluation (AUPRC + recall@%.0f%%FPR)" % (TARGET_FPR * 100))
+hdr("Experiment 1 — 2x2 cross-evaluation (AUPRC + precision@recall%.0f%%)" % (TARGET_RECALL * 100))
 cells = {"A": "p5m__p5_test", "B": "p5m__p6_test", "C": "p6m__p5_test", "D": "p6m__p6_test"}
-print(f"{'cell':<6}{'set':<16}{'AUPRC':>10}{'recall@FPR':>14}")
+print(f"{'cell':<6}{'set':<16}{'AUPRC':>10}{'prec@rec90':>13}")
 for name, key in cells.items():
     d = load(key)
     if d is None:
-        print(f"{name:<6}{key:<16}{'SKIP (no file)':>24}"); continue
+        print(f"{name:<6}{key:<16}{'SKIP (no file)':>23}"); continue
     score = d["prob"] if "prob" in d else d["logit"]
     ap = average_precision_score(d["y"], score)
-    rec = recall_at_fpr(d["y"], score)
-    print(f"{name:<6}{key:<16}{ap:>10.4f}{rec:>14.4f}")
+    pr = precision_at_recall(d["y"], score)
+    print(f"{name:<6}{key:<16}{ap:>10.4f}{pr:>13.4f}")
 
 # ----------------------------------------------------------------------------
 # Experiment 3 — geometry per available set (linear probe / silhouette / kNN agree)
